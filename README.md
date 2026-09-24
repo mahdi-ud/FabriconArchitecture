@@ -37,7 +37,7 @@ The engineering team at [Unite Digital LLC](https://unitedigital.com) was tasked
 - [Fabricon 2: Medallion-Based Environment Architecture](./Fabricon2/README.md)
 - [Fabricon 3: Medallion-Based Environment Architecture for Large Data Volumes](./Fabricon3/README.md)
 - [Fabricon 4: Seamless Reporting with Database Mirroring](./Fabricon4/README.md)
-- Fabricon 5: Realtime Reporting with EventHouse (Coming soon)
+- [Fabricon 5: Automated Deployment and Promotion](./Fabricon5/README.md)
 - [Fabricon N: Code Organization Using Notebooks](./FabriconN/README.md)
 - [Fabricon R: Report Promotion Across Environments](./FabriconR/README.md)
 

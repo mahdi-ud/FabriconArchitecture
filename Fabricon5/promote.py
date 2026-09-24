@@ -289,29 +289,73 @@ def refresh_semantic_models(target_workspace, items):
             time.sleep(10)
 
 
+def git_provider_branch_check():
+    """Return a function that answers "does this branch still exist", for
+    whichever git provider is configured, or None if neither is.
+
+    Azure DevOps needs ADO_TOKEN, ADO_ORG_URL, ADO_PROJECT and ADO_REPO.
+    GitHub needs GITHUB_TOKEN and GITHUB_REPOSITORY (owner/repo), both of
+    which Actions provides by default.
+    """
+    ado_token = os.environ.get("ADO_TOKEN")
+    gh_token = os.environ.get("GITHUB_TOKEN")
+
+    if ado_token and os.environ.get("ADO_ORG_URL"):
+        org = os.environ["ADO_ORG_URL"].rstrip("/")
+        project = os.environ["ADO_PROJECT"]
+        repo = os.environ["ADO_REPO"]
+
+        def ado_branch_exists(name):
+            req = urllib.request.Request(
+                f"{org}/{project}/_apis/git/repositories/{repo}/refs"
+                f"?filter=heads/{urllib.parse.quote(name)}&api-version=7.1",
+                headers={"Authorization": "Bearer " + ado_token},
+            )
+            with urllib.request.urlopen(req) as resp:
+                refs = json.loads(resp.read()).get("value", [])
+            return any(r.get("name") == f"refs/heads/{name}" for r in refs)
+
+        return ado_branch_exists
+
+    if gh_token and os.environ.get("GITHUB_REPOSITORY"):
+        repository = os.environ["GITHUB_REPOSITORY"]
+
+        def github_branch_exists(name):
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{repository}/git/ref/"
+                f"heads/{urllib.parse.quote(name)}",
+                headers={
+                    "Authorization": "Bearer " + gh_token,
+                    "Accept": "application/vnd.github+json",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    return resp.status == 200
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    return False
+                raise
+
+        return github_branch_exists
+
+    return None
+
+
 def cleanup_feature_workspaces():
     """Delete branched-out feature workspaces whose git branch is gone (merged
     and deleted). Guardrails: only workspaces whose name starts with
     FEATURE_WS_PREFIX, and only when the connected branch no longer exists in
     the repo. A workspace with a live branch is active work and is left alone."""
     prefix = os.environ.get("FEATURE_WS_PREFIX")
-    ado_token = os.environ.get("ADO_TOKEN")
-    if not prefix or not ado_token:
-        print("cleanup: FEATURE_WS_PREFIX or ADO_TOKEN not set, skipping")
+    if not prefix:
+        print("cleanup: FEATURE_WS_PREFIX not set, skipping")
         return
-    org = os.environ["ADO_ORG_URL"].rstrip("/")
-    project = os.environ["ADO_PROJECT"]
-    repo = os.environ["ADO_REPO"]
 
-    def branch_exists(name):
-        req = urllib.request.Request(
-            f"{org}/{project}/_apis/git/repositories/{repo}/refs"
-            f"?filter=heads/{urllib.parse.quote(name)}&api-version=7.1",
-            headers={"Authorization": "Bearer " + ado_token},
-        )
-        with urllib.request.urlopen(req) as resp:
-            refs = json.loads(resp.read()).get("value", [])
-        return any(r.get("name") == f"refs/heads/{name}" for r in refs)
+    branch_exists = git_provider_branch_check()
+    if branch_exists is None:
+        print("cleanup: no git provider credentials set, skipping")
+        return
 
     _, _, body = call("GET", f"{FABRIC}/workspaces")
     for ws in body["value"]:

@@ -35,7 +35,7 @@ Created by the engineering team at Unite Digital LLC.
 | **2** | Medallion-Based Environment | Projects needing structured Bronze/Silver/Gold data layers |
 | **3** | Large Data Volumes | When duplicating bronze data across envs is impractical |
 | **4** | Seamless Reporting | Near real-time reporting from mirrored databases |
-| **5** | Realtime Reporting with EventHouse | (Coming soon) |
+| **5** | Automated Deployment and Promotion | Automating promotion from dev to prod with rebinding and verification |
 | **N** | Code Organization Using Notebooks | Extension for any numbered pattern (e.g., "2N") |
 | **R** | Report Promotion Across Environments | Extension for promoting Power BI reports/semantic models across Dev/Prod |
 

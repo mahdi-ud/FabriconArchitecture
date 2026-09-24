@@ -1,77 +1,68 @@
-# Fabricon 5: Deployment and Promotion
+# Fabricon 5: Automated Deployment and Promotion
 
-> Fabricon 5 builds on the concepts presented in [Fabricon 4](../Fabricon4/README.md).
+> Fabricon 5 builds on the branching strategy in [Fabricon 2](../Fabricon2/README.md), the DevOps notebook in [Fabricon N](../FabriconN/README.md), and the report promotion approach in [Fabricon R](../FabriconR/README.md).
 
-Microsoft Fabric gives you three building blocks for CI/CD: [Git integration](https://learn.microsoft.com/en-us/fabric/cicd/git-integration/intro-to-git-integration), [deployment pipelines](https://learn.microsoft.com/en-us/fabric/cicd/deployment-pipelines/intro-to-deployment-pipelines), and the [REST APIs](https://learn.microsoft.com/en-us/rest/api/fabric/articles/). None of them on its own is a deployment process. Fabricon 5 composes them into one, using git as the source of truth, deployment pipelines to move content between workspaces, and a small script to orchestrate and check the result.
+Between them, the earlier patterns already describe everything that needs to happen when code moves from development to production: Fabricon 2 defines the branches and the feature workspace, Fabricon N provides the DevOps notebook that repoints notebooks and semantic models after a deployment, and Fabricon R explains how reports and models travel through a deployment pipeline. What none of them provides is the machinery that carries those steps out, so in practice a person has to merge the pull request, remember to open the target workspace and click Update, run the deployment pipeline, and then execute the DevOps notebook afterwards in the right workspace. Fabricon 5 replaces that sequence of remembered actions with a pipeline that performs them in order, refuses to start when the workspace is in a state that would make the result unsafe, and checks its own work before reporting the release as finished.
 
-## The problems we are solving
+## The problems this solves
 
-Teams that edit workspaces directly and promote by hand tend to run into the same four problems.
+Teams promoting by hand tend to run into the following four problems.
 
-The first is drift. Anyone can edit or create an item directly in a workspace without committing it, and the only indication is a badge on the Source control panel that nobody is watching. Given enough time, production ends up running code that exists in no branch at all.
+Drift comes first, and it arises because anyone can create or edit an item directly in a workspace without committing it, while the only sign that they have done so is a badge on the Source control panel that nobody is watching. Given enough time, production ends up running notebooks that exist in no branch at all, so rebuilding that workspace would lose them permanently.
 
-The second is forgotten promotion. Merging a pull request updates git, not the workspace. Someone still has to open the target workspace and click Update. When that step is missed, a fix that was reviewed and merged weeks ago is still not running in production, and nothing anywhere reports it.
+The second problem is the promotion that never happens, since merging a pull request updates the branch rather than the workspace, and somebody still has to open the target workspace and apply the change. When that step is missed, a fix that was reviewed and approved weeks earlier is still not running anywhere, and because nothing reports the gap it is usually discovered only when the original bug is reported for a second time.
 
-The third is broken references. Item IDs are assigned per workspace and are never stored in git, so anything outside Fabric that points at an item by ID breaks the moment that item is deleted and recreated. Direct Lake semantic models have a related problem: deploy one to production and it keeps reading the development lakehouse until something re-points it.
+The third is the reference that quietly points at the wrong environment. Item IDs are assigned per workspace and are never stored in git, so anything outside Fabric that refers to an item by ID breaks the moment that item is deleted and recreated. Direct Lake semantic models have a related weakness, in that one arriving in production carries on reading the development lakehouse until the rebind described in Fabricon R is executed against it.
 
-The fourth is environment leakage, where notebooks and models carry hardcoded workspace and lakehouse IDs and therefore cannot run in two environments without being edited.
+The fourth is environment leakage, where notebooks and models carry hardcoded workspace and lakehouse IDs and therefore cannot run unchanged in more than one environment.
 
-All four have the same root cause. The process depends on a person remembering to do something.
+All four share the same root cause, which is that the process depends on a person remembering to do something.
 
-## Workspace roles
+## 1. Where Git stops
 
-Continuing the `CRM` example from [Fabricon 2](../Fabricon2/README.md), three kinds of workspace are involved, and they have different rules.
+Fabricon 2 links the `main` branch to the production workspace and promotes code by merging `develop` into `main`. That works, but it leaves production reachable from two directions, because git can push into it and anyone holding Contributor access can edit it directly. Fabricon 5 narrows this to a single direction by disconnecting the production code workspace from git altogether and feeding it only through the deployment pipeline that Fabricon R already uses for reports.
 
-Feature workspaces are created per ticket by [branching out](https://learn.microsoft.com/en-us/fabric/cicd/git-integration/manage-branches), which creates a branch and a workspace together in a single click. The developer owns it, works in it freely, and deletes it when the ticket is done.
+> Fabricon recommends that the production code workspace has no Git connection. If the promotion pipeline is the only way in, then editing production directly is not merely discouraged, it is impossible.
 
-`CRM-Dev` is bound to the `develop` branch and mirrors it. Developers should hold Viewer here rather than Contributor, because with feature workspaces there is no longer a reason to edit the shared workspace directly.
+This supersedes the `main` to production link described in Fabricon 2, Fabricon 3 and Fabricon R, and it leaves three kinds of workspace with clearly different rules. Feature workspaces are created per ticket with the `Branch out to new workspace` feature from Fabricon 2, and the developer who created one owns it, works in it freely and deletes it once the ticket is done. The development workspace tracks `develop` and mirrors it, which means developers no longer need Contributor access there and are better given Viewer, since with a feature workspace of their own there is nothing left that they would legitimately edit in the shared one. The production workspace tracks nothing and receives content only when the pipeline promotes it.
 
-`CRM-Prod` has no git connection at all. It receives content only through the deployment pipeline.
+From a developer's point of view the whole workflow is to branch out, work, commit from the Source control panel and open a pull request, which is the same sequence Fabricon 2 already describes. Everything that happens after the merge is automated.
 
-> Fabricon recommends leaving the production workspace disconnected from git. If the promotion pipeline is the only way into production, direct edits are not just discouraged, they are impossible.
+## 2. The promotion pipeline
 
-![Fabric - Branch out to new workspace](../Images/git-branch-to-new-workspace.png)
+An Azure DevOps pipeline or a GitHub Actions workflow runs on merges to `develop` and carries out seven steps, each of which raises on failure so that a partial or unverified promotion stops the run rather than continuing quietly.
 
-From the developer's side the whole workflow is: branch out, work, commit from the Source control panel, open a pull request. Everything after the merge is automated.
+1. **Gate.** The run begins by reading the [git status](https://learn.microsoft.com/en-us/rest/api/fabric/core/git/get-status) of the development workspace, and if any item has uncommitted changes it stops and lists them, which is what makes drift impossible to ship.
+2. **Sync.** The workspace is then [updated from git](https://learn.microsoft.com/en-us/rest/api/fabric/core/git/update-from-git). This call needs an `allowOverrideItems` consent flag before it will touch existing items, and passing it is only safe because the gate has just established that there is nothing uncommitted to lose, so the order of these two steps matters more than either step considered alone.
+3. **Deploy.** With development matching the branch, the [deployment pipeline](https://learn.microsoft.com/en-us/rest/api/fabric/core/deployment-pipelines/deploy-stage-content) moves content to the production stage, overwriting the paired items in place so that their IDs and URLs remain the same from one release to the next.
+4. **Bind.** The references that a deployment cannot resolve on its own are then repointed, using the same operations as the DevOps notebook in Fabricon N and Fabricon R but running them automatically rather than waiting for someone to execute the notebook.
+5. **Verify.** Every production item is read back and its definition searched for development identities, meaning the workspace ID, item IDs and SQL endpoint names, and any match fails the release and names the item responsible.
+6. **Refresh.** The semantic models that were deployed are refreshed, because a deployment does not refresh them and until it happens the reports built on them return an error.
+7. **Clean up.** Finally, feature workspaces whose branch has been merged and deleted are removed, subject to two guards: the workspace name must match the agreed feature prefix, and the branch must genuinely be gone.
 
-## The promotion pipeline
+A reference implementation is included in this folder as [`promote.py`](./promote.py), written against the standard library and configured entirely through environment variables, alongside pipeline definitions for [Azure DevOps](./ado-pipeline.yml) and [GitHub Actions](./github-pipeline.yml). Bringing another domain onto the pattern is a copy of the pipeline definition with different IDs.
 
-An Azure DevOps pipeline (or a GitHub Actions workflow) runs on merges to `develop` and performs seven steps. Every step raises on failure, so a partial or unverified promotion stops the run rather than continuing quietly.
+> Fabricon recommends running the promotion as a service principal rather than as a person, so that releases are attributed to the process and do not depend on an individual's account. This requires the *Service principals can use Fabric APIs* tenant setting, with the principal added as an Admin on both workspaces and on the deployment pipeline.
 
-1. Gate. Read the [git status](https://learn.microsoft.com/en-us/rest/api/fabric/core/git/get-status) of the Dev workspace. If any item has uncommitted changes, stop and list them. This is the step that makes drift impossible to ship.
-2. Sync. [Update the workspace from git](https://learn.microsoft.com/en-us/rest/api/fabric/core/git/update-from-git). The API needs an `allowOverrideItems` consent flag to touch existing items, which is only safe because the gate has just proved there is nothing uncommitted to lose. The order of these two steps matters more than either step on its own.
-3. Deploy. Call the [deployment pipeline](https://learn.microsoft.com/en-us/rest/api/fabric/core/deployment-pipelines/deploy-stage-content) to move content from the Dev stage to the Prod stage. Fabric overwrites the paired production items in place, so their IDs and URLs stay the same across every release.
-4. Bind. Re-point the references that the deploy cannot fix by itself. These are covered in the next section.
-5. Verify. Read every production item back and search its definition for development-stage identities: the workspace ID, item IDs, SQL endpoint names. Any match fails the release and names the item.
-6. Refresh. Refresh the semantic models that were deployed. A deployment does not refresh them, and until they are refreshed the reports built on them return an error.
-7. Clean up. Delete feature workspaces whose branch has been merged and removed. Two guards apply: the workspace name must match the agreed feature prefix, and the branch must actually be gone.
+## 3. Keeping references correct
 
-This folder contains a reference implementation in [`promote.py`](./promote.py), written against the standard library and configured entirely through environment variables, together with an [`azure-pipelines.yml`](./azure-pipelines.yml) template. Adding another domain is a copy of the YAML with different IDs.
+Most references look after themselves, because Fabric maintains a pairing between each source item and its counterpart in the target stage and rewires the connections between paired items as it deploys them, which covers a report and its semantic model, a data pipeline and the notebook it calls, a notebook and a lakehouse in the same pipeline, and the targets of OneLake shortcuts.
 
-> Fabricon recommends running the pipeline as a service principal through an Azure DevOps service connection rather than as a person. You will need the *Service principals can use Fabric APIs* tenant setting enabled, and the principal added as an Admin on both workspaces and on the deployment pipeline.
+Two kinds of reference are left over, and they are the reason the bind step exists. The first is a notebook whose default lakehouse lives in a different workspace, which is the normal arrangement under Fabricon 3 where data workspaces are kept separate from code, and it is handled by looking up the lakehouse of the same name in the target stage and rewriting the attachment, exactly as the DevOps notebook in Fabricon N does with `DATA_WORKSPACE_ID`. The second is a Direct Lake semantic model, which [by design](https://learn.microsoft.com/en-us/fabric/cicd/deployment-pipelines/understand-the-deployment-process#considerations-and-limitations) still points at the source stage after being deployed, and which Fabricon R repoints using Semantic Link Labs; the same rebind happens here, driven by a map of endpoints built by matching lakehouses by name across the two stages.
 
-## Keeping references correct across stages
+Because both rebinds work by name rather than by identifier, a notebook or model created yesterday is handled correctly on its first deployment without anyone configuring anything on its behalf.
 
-Most references fix themselves. Fabric maintains a pairing between each source item and its counterpart in the target stage, and during a deployment it rewires the connections between paired items: a report to its semantic model, a data pipeline to the notebook it calls, a notebook to a lakehouse in the same pipeline, and the targets of OneLake shortcuts. None of that needs configuring.
+Fabric also offers [deployment rules](https://learn.microsoft.com/en-us/fabric/cicd/deployment-pipelines/create-rules), which perform the same repointing through the portal and are worth knowing about, although they are set one item at a time and only by that item's owner, they are invisible to git, and they are lost if the workspace is ever unassigned and reassigned to the pipeline.
 
-Two kinds of reference do not autobind, and the bind step exists for them:
+> Fabricon recommends rebinding through automation rather than deployment rules, because a rule has to be created by somebody who remembers that a new model needs one, and until they do, production is reading development data.
 
-- Notebooks whose default lakehouse lives in a different workspace, which is the normal case when data workspaces are kept separate from code workspaces. The script looks up the same-named lakehouse in the target stage and rewrites the attachment.
-- Direct Lake semantic models. This is [documented behavior](https://learn.microsoft.com/en-us/fabric/cicd/deployment-pipelines/understand-the-deployment-process#considerations-and-limitations): a deployed Direct Lake model still points at the source stage's SQL endpoint. The script matches lakehouses by name across the two stages, builds a map of their endpoints, and rewrites the connection inside the model definition.
+Whichever mechanism did the rebinding, the verify step is what makes the result trustworthy, since it is cheap to run and turns an assumption about production into a release that fails when the assumption turns out to be wrong.
 
-Both rebinds work by name, which means a notebook or model that did not exist yesterday is handled correctly on its first deployment without anyone configuring anything for it.
+## 4. Runtime configuration
 
-Fabric also offers [deployment rules](https://learn.microsoft.com/en-us/fabric/cicd/deployment-pipelines/create-rules), which can do the same re-pointing through the portal. They work, but they are set per item, only by the item's owner, they are invisible to git, and they are lost if the workspace is ever unassigned and reassigned to the pipeline.
+Values that differ between environments belong in a [variable library](https://learn.microsoft.com/en-us/fabric/cicd/variable-library/variable-library-overview) rather than in the code. The variables and their value sets are versioned in git, while the choice of which value set is active is a per-workspace setting that survives deployments, so the same committed notebook resolves development values in one workspace and production values in another. Fabricon R already recommends variable libraries for environment-specific shortcut targets, and the same mechanism covers the workspace and lakehouse identifiers that would otherwise be hardcoded in notebooks.
 
-> Fabricon recommends automating the rebinding rather than relying on deployment rules. A rule has to be created by someone who remembers that the new model needs one, and until they do, production is reading development data.
-
-Whichever mechanism did the binding, the verify step is what makes the result trustworthy. It is cheap to run and it turns an assumption about production into a release that fails when the assumption is wrong.
-
-### Runtime configuration
-
-Values that change between environments belong in a [variable library](https://learn.microsoft.com/en-us/fabric/cicd/variable-library/variable-library-overview) rather than in the code. The variables and their value sets are versioned in git, while the choice of which value set is active is a per-workspace setting that survives deployments. The same committed notebook then resolves development values in Dev and production values in Prod.
-
-Put the resolution logic in the shared `Common` notebook that every pipeline step already runs with `%run`, not in each notebook. It needs one addition for this pattern to work: a workspace that is not in the configuration is a branched-out feature workspace and should fall back to development values, with a warning rather than silently.
+The resolution itself belongs in the shared `Common` notebook that every pipeline step already runs with `%run`, which is where Fabricon N places it, and the change is to read the values from the library rather than from constants declared in the notebook. The fallback to development values for an unrecognised workspace, which Fabricon N already includes, remains exactly as important, because a branched-out feature workspace has an identifier that no configuration can know in advance:
 
 ```python
 config = variable_library_values()          # normal path
@@ -80,37 +71,51 @@ if config is None:                          # unknown workspace = branched-out f
     config = dev_defaults()
 ```
 
-## Working as a team
+## 5. Working as a team
 
-A common worry when several people are working at once is that their changes will collide during deployment. They do not, because they never meet there. Changes converge in git through pull requests, and when two people have edited the same notebook, the second pull request shows a conflict in readable text at review time. By the time `develop` moves, it is one history, and the pipeline treats a batch of forty merges exactly as it treats one.
+A common worry when several people are working at once is that their changes will collide during deployment, but they never meet there, because changes converge in git through pull requests and two people who have edited the same notebook find out at review time, in a readable text diff, rather than at release time. By the time `develop` moves it is a single history, and the pipeline treats a batch of forty merges exactly as it treats one.
 
-That leaves the choice of cadence. Promoting on every merge keeps batches small, so when something does break, the change responsible is a single pull request. The alternative is a release train: let merges keep the Dev workspace current, and promote to production on a schedule or behind an [environment approval](https://learn.microsoft.com/en-us/azure/devops/pipelines/process/approvals). The same pipeline supports either, since the sync and promote halves can be triggered separately.
+That leaves the question of cadence. Promoting on every merge keeps batches small, so that when something does break the change responsible is a single pull request, whereas a release train lets merges keep the development workspace current and promotes to production on a schedule or behind an [environment approval](https://learn.microsoft.com/en-us/azure/devops/pipelines/process/approvals). Both work with the same pipeline, since the sync and promote halves can be triggered independently.
 
-> Fabricon recommends turning on *delete source branch on merge* in the repository. With the cleanup step, feature workspaces then retire themselves.
+> Fabricon recommends enabling *delete source branch on merge* in the repository, because together with the cleanup step it allows feature workspaces to retire themselves.
 
-## Exceptions and limitations
+## 6. Exceptions and limitations
 
-Deletions do not propagate. A deployment never removes a production item that is missing from the source, so retiring something is a separate manual step that belongs in the runbook.
+Deletions do not propagate, since a deployment never removes a production item that is missing from the source, which means retiring something is a separate manual step that belongs in the runbook.
 
-Some state is intentionally not copied, including schedules, permissions, credentials and the active value set. This is the behavior you want, since a development schedule should not overwrite a production one, but it does mean each stage needs configuring once. The verify step can assert the settings that matter.
+Some state is deliberately not copied, including schedules, permissions, credentials and the active value set of a variable library. This is the behaviour you want, as a development schedule should never overwrite a production one, but it does mean each stage needs configuring once, and the verify step is a convenient place to assert the settings that matter.
 
-Deleting an item and recreating it is the one action that breaks the guarantees here, because the replacement gets a new ID and everything referencing the old one breaks. Publish over the existing item instead. A pull request check that flags deleted `.platform` files is a reasonable guard.
+Deleting an item and recreating it is the one action that undoes the guarantees described here, because the replacement is issued a new ID and everything that referenced the old one breaks, so publish over the existing item instead. A pull request check that flags deleted `.platform` files is a reasonable guard against doing it by accident.
 
-Tenant-level connections and shortcuts to other workspaces may be genuinely shared between stages, or they may need to differ. Classify them when a domain is onboarded rather than assuming either.
+Connections defined at tenant level, and shortcuts that reach into other workspaces, may be genuinely shared between stages or may need to differ, so classify them when a domain is onboarded rather than assuming either.
 
-Finally, support for some item types is still in preview for git, deployment pipelines, or both. Test a domain's inventory in a throwaway pair of workspaces before onboarding it.
+Support for some item types is still in preview for git, for deployment pipelines, or for both, which makes it worth testing a domain's inventory in a throwaway pair of workspaces before onboarding it.
 
-## Onboarding a domain
+## 7. Onboarding a domain
 
-1. Reconcile what is already in production: commit or deliberately retire every item that exists only in the workspace, resolve conflicts, and align folder structures, since pairing matches on name, type and folder.
-2. Create the deployment pipeline, assign both workspaces, and confirm every item is paired before deploying anything.
-3. Set the per-stage state: active value set, schedules, credentials.
+1. Reconcile what is already in production, committing or deliberately retiring every item that exists only in the workspace, resolving conflicts, and aligning folder structures, since pairing matches on name, type and folder.
+2. Create the deployment pipeline, assign both workspaces and confirm that every item is paired before deploying anything.
+3. Set the state that deployment does not copy, which is the active value set, schedules and credentials.
 4. Classify connections and shortcuts as shared or stage-specific.
-5. Copy the pipeline YAML, set the IDs and the feature workspace prefix, and run it once with someone watching.
-6. Move developers to Viewer on Dev, remove standing access to Prod, and enable branch policies on `develop`.
+5. Copy the pipeline definition, set the IDs and the feature workspace prefix, and run it once with somebody watching.
+6. Move developers to Viewer on the development workspace, remove standing access to production, and enable branch policies on `develop`.
 
-## Related links
+## What Fabricon 5 Solves
 
-* [CI/CD workflow options in Fabric](https://learn.microsoft.com/en-us/fabric/cicd/manage-deployment)
-* [The deployment pipelines process](https://learn.microsoft.com/en-us/fabric/cicd/deployment-pipelines/understand-the-deployment-process)
-* [fabric-cicd](https://microsoft.github.io/fabric-cicd/), a Microsoft library that applies the same definition-rewriting approach used by the bind step
+| Problem | Solution |
+| --- | --- |
+| Direct edits in production workspaces | Production disconnected from Git and fed only by the promotion pipeline |
+| Uncommitted work in the development workspace reaching production | Gate step refuses to promote a workspace that does not match its branch |
+| Merged changes that are never promoted | Promotion triggered by the merge itself rather than by a person |
+| DevOps notebook rebind forgotten or run out of order | Rebind performed automatically as a step of every release |
+| Direct Lake models and notebooks silently reading the wrong environment | Verify step fails the release when production still references development |
+| Reports erroring after a deployment | Semantic models refreshed as part of the release |
+| Feature workspaces accumulating after their branch is merged | Cleanup step removes them once the branch is gone |
+
+## References
+
+- [CI/CD workflow options in Fabric](https://learn.microsoft.com/en-us/fabric/cicd/manage-deployment)
+- [Understand the deployment pipelines process](https://learn.microsoft.com/en-us/fabric/cicd/deployment-pipelines/understand-the-deployment-process)
+- [Git integration in Fabric](https://learn.microsoft.com/en-us/fabric/cicd/git-integration/intro-to-git-integration)
+- [Variable libraries](https://learn.microsoft.com/en-us/fabric/cicd/variable-library/variable-library-overview)
+- [fabric-cicd](https://microsoft.github.io/fabric-cicd/), a Microsoft library that applies the same definition-rewriting approach used by the bind step

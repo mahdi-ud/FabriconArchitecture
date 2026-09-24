@@ -28,6 +28,8 @@ This workspace contains all code-related items, such as notebooks and data pipel
 
 This workspace contains all code-related items, such as notebooks and data pipelines. It is linked to the `main` branch.
 
+> When using [Fabricon 5](../Fabricon5/README.md), this workspace has no Git connection and receives code through the promotion pipeline instead.
+
 ## CRM-Data-Dev & CRM-Data-Prod Workspaces
 
 These workspaces contain all data-related items, such as lakehouses, warehouses, and eventhouses. Source control is generally not required.
